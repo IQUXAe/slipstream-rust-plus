@@ -49,6 +49,7 @@ const DNS_POLL_SLICE_US: u64 = 10_000;
 const RECONNECT_SLEEP_MIN_MS: u64 = 1;
 const RECONNECT_SLEEP_MAX_MS: u64 = 5_000;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
+const STALL_TIMEOUT_US: u64 = 15_000_000;
 
 fn is_ipv6_unspecified(host: &str) -> bool {
     host.parse::<Ipv6Addr>()
@@ -230,6 +231,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut zero_send_with_streams = 0u64;
         let mut last_flow_block_log_at = 0u64;
         let mut current_resolver_index = 0usize;
+        let mut last_progress_us = unsafe { picoquic_current_time() };
 
         loop {
             let current_time = unsafe { picoquic_current_time() };
@@ -408,7 +410,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
 
                 if !packet_produced {
-                    // No packet produced from any path
                     zero_send_loops = zero_send_loops.saturating_add(1);
                     let streams_len = unsafe { (*state_ptr).streams_len() };
                     if streams_len > 0 {
@@ -421,9 +422,23 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                                 }
                             }
                         }
+                        let ready = unsafe { (*state_ptr).is_ready() };
+                        if ready
+                            && current_time.saturating_sub(last_progress_us) >= STALL_TIMEOUT_US
+                        {
+                            warn!(
+                                "connection stalled for {}ms with {} active streams; reconnecting",
+                                current_time.saturating_sub(last_progress_us) / 1_000,
+                                streams_len
+                            );
+                            break;
+                        }
+                    } else {
+                        last_progress_us = current_time;
                     }
                     break;
                 }
+                last_progress_us = current_time;
 
                 if addr_to.ss_family == 0 {
                     break;

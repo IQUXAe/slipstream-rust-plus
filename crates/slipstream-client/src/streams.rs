@@ -12,7 +12,7 @@ use slipstream_ffi::picoquic::{
     picoquic_stop_sending, picoquic_stream_data_consumed, slipstream_is_flow_blocked,
 };
 use slipstream_ffi::{abort_stream_bidi, SLIPSTREAM_FILE_CANCEL_ERROR, SLIPSTREAM_INTERNAL_ERROR};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream as TokioTcpStream;
@@ -37,6 +37,7 @@ pub(crate) struct ClientState {
     debug_enqueued_bytes: u64,
     debug_last_enqueue_at: u64,
     acceptor_limit_logged: bool,
+    removed_stream_ids: HashSet<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,6 +440,7 @@ impl ClientState {
             debug_enqueued_bytes: 0,
             debug_last_enqueue_at: 0,
             acceptor_limit_logged: false,
+            removed_stream_ids: HashSet::new(),
         }
     }
 
@@ -464,6 +466,10 @@ impl ClientState {
 
     pub(crate) fn debug_snapshot(&self) -> (u64, u64) {
         (self.debug_enqueued_bytes, self.debug_last_enqueue_at)
+    }
+
+    fn mark_stream_removed(&mut self, stream_id: u64) {
+        self.removed_stream_ids.insert(stream_id);
     }
 
     pub(crate) fn stream_debug_metrics(&self) -> ClientStreamMetrics {
@@ -554,6 +560,7 @@ impl ClientState {
         self.debug_enqueued_bytes = 0;
         self.debug_last_enqueue_at = 0;
         self.acceptor_limit_logged = false;
+        self.removed_stream_ids.clear();
     }
 }
 
@@ -716,6 +723,7 @@ pub(crate) unsafe extern "C" fn client_callback(
                 _ => "unknown",
             };
             if let Some(stream) = state.streams.remove(&stream_id) {
+                state.mark_stream_removed(stream_id);
                 warn!(
                     "stream {}: reset event={} rx_bytes={} tx_bytes={} queued={} consumed_offset={} fin_offset={:?} recv_state={:?} send_state={:?}",
                     stream_id,
@@ -801,13 +809,15 @@ fn handle_stream_data(
 
     {
         let Some(stream) = state.streams.get_mut(&stream_id) else {
-            warn!(
-                "stream {}: data for unknown stream len={} fin={}",
-                stream_id,
-                data.len(),
-                fin
-            );
-            unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR) };
+            if !state.removed_stream_ids.contains(&stream_id) {
+                warn!(
+                    "stream {}: data for unknown stream len={} fin={}",
+                    stream_id,
+                    data.len(),
+                    fin
+                );
+                unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR) };
+            }
             return;
         };
 
@@ -898,11 +908,13 @@ fn handle_stream_data(
             debug!("stream {}: resetting", stream_id);
         }
         unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR) };
+        state.mark_stream_removed(stream_id);
         state.streams.remove(&stream_id);
     } else if remove_stream {
         if debug_streams {
             debug!("stream {}: finished", stream_id);
         }
+        state.mark_stream_removed(stream_id);
         state.streams.remove(&stream_id);
     }
 
@@ -1324,6 +1336,7 @@ pub(crate) fn handle_command(
                 if !forced_failure {
                     unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
                 }
+                state.mark_stream_removed(stream_id);
                 return;
             }
             if !reservation.is_fresh() {
@@ -1334,6 +1347,7 @@ pub(crate) fn handle_command(
                 if !forced_failure {
                     unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
                 }
+                state.mark_stream_removed(stream_id);
                 return;
             }
             let read_limit = stream_read_limit_chunks(
@@ -1419,6 +1433,7 @@ pub(crate) fn handle_command(
                     data.len()
                 );
                 unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
+                state.mark_stream_removed(stream_id);
                 state.streams.remove(&stream_id);
             } else if let Some(stream) = state.streams.get_mut(&stream_id) {
                 stream.tx_bytes = stream.tx_bytes.saturating_add(data.len() as u64);
@@ -1461,10 +1476,12 @@ pub(crate) fn handle_command(
                 if !forced_failure {
                     unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
                 }
+                state.mark_stream_removed(stream_id);
                 state.streams.remove(&stream_id);
             } else if let Some(stream) = state.streams.get_mut(&stream_id) {
                 stream.send_state = StreamSendState::FinQueued;
                 if stream.recv_state.is_closed() && stream.flow.queued_bytes == 0 {
+                    state.mark_stream_removed(stream_id);
                     state.streams.remove(&stream_id);
                 }
             }
@@ -1484,6 +1501,7 @@ pub(crate) fn handle_command(
             } else {
                 warn!("stream {}: tcp read error (unknown stream)", stream_id);
             }
+            state.mark_stream_removed(stream_id);
             unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
         }
         Command::StreamWriteError { stream_id } => {
@@ -1500,6 +1518,7 @@ pub(crate) fn handle_command(
             } else {
                 warn!("stream {}: tcp write error (unknown stream)", stream_id);
             }
+            state.mark_stream_removed(stream_id);
             unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
         }
         Command::StreamWriteDrained { stream_id, bytes } => {
@@ -1530,6 +1549,7 @@ pub(crate) fn handle_command(
                         },
                     ) {
                         unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
+                        state.mark_stream_removed(stream_id);
                         state.streams.remove(&stream_id);
                         return;
                     }
@@ -1542,6 +1562,7 @@ pub(crate) fn handle_command(
                 }
             }
             if remove_stream {
+                state.mark_stream_removed(stream_id);
                 state.streams.remove(&stream_id);
             }
             check_stream_invariants(state, stream_id, "StreamWriteDrained");
