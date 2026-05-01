@@ -1,6 +1,6 @@
 use slipstream_dns::{
-    build_qname, decode_query_with_domains, encode_query, DecodeQueryError, QueryParams, Rcode,
-    CLASS_IN, RR_TXT,
+    build_qname, build_query_with_edns0_payload, decode_query_with_domains, encode_query,
+    DecodeQueryError, QueryParams, Rcode, CLASS_IN, RR_TXT,
 };
 
 #[test]
@@ -88,4 +88,14 @@ fn decode_query_with_domains_rejects_empty_subdomain_on_overlap() {
         }
         other => panic!("expected name error, got {:?}", other),
     }
+}
+
+#[test]
+fn decode_query_with_domains_accepts_edns0_payload() {
+    let payload = vec![0xAB; 512];
+    let query =
+        build_query_with_edns0_payload(&payload, "example.com", 123).expect("build edns0 query");
+
+    let decoded = decode_query_with_domains(&query, &["example.com"]).expect("decode edns0 query");
+    assert_eq!(decoded.payload, payload);
 }

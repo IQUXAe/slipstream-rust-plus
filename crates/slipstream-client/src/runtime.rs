@@ -5,7 +5,7 @@ use self::path::{
     apply_path_mode, drain_path_events, fetch_path_quality, find_resolver_by_addr_mut,
     loop_burst_total, path_poll_burst_max,
 };
-use self::setup::{bind_tcp_listener, bind_udp_socket, map_io};
+use self::setup::{bind_tcp_listener, bind_udp_socket, compute_transport_mtu, map_io};
 use crate::dns::{
     add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
     refresh_resolver_path, resolve_resolvers, resolver_mode_to_c, send_poll_queries,
@@ -19,7 +19,7 @@ use crate::streams::{
     ClientState, Command,
 };
 use slipstream_core::{net::is_transient_udp_error, normalize_dual_stack_addr};
-use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_TXT};
+use slipstream_dns::build_transport_query;
 use slipstream_ffi::{
     configure_quic_with_custom,
     picoquic::{
@@ -69,8 +69,12 @@ fn drain_disconnected_commands(command_rx: &mut mpsc::UnboundedReceiver<Command>
 }
 
 pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
-    let mtu = slipstream_dns::max_payload_len_for_domain(config.domain)
-        .map_err(|err| ClientError::new(err.to_string()))? as u32;
+    let resolver_modes: Vec<ResolverMode> = config
+        .resolvers
+        .iter()
+        .map(|resolver| resolver.mode)
+        .collect();
+    let mtu = compute_transport_mtu(config.domain, &resolver_modes)?;
     let udp = bind_udp_socket().await?;
 
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
@@ -453,33 +457,8 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     }
                 }
 
-                // Adaptive MTU: Choose encoding based on packet size
-                // Small packets (<= 200 bytes): Use QNAME encoding (resilient mode)
-                // Large packets (> 200 bytes): Use EDNS0 OPT encoding (high-speed mode)
-                let packet = if send_length <= slipstream_dns::EDNS0_THRESHOLD {
-                    // QNAME encoding (legacy/resilient mode)
-                    let qname = build_qname(&send_buf[..send_length], config.domain)
-                        .map_err(|err| ClientError::new(err.to_string()))?;
-                    let params = QueryParams {
-                        id: dns_id,
-                        qname: &qname,
-                        qtype: RR_TXT,
-                        qclass: CLASS_IN,
-                        rd: true,
-                        cd: false,
-                        qdcount: 1,
-                        is_query: true,
-                    };
-                    encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?
-                } else {
-                    // EDNS0 OPT encoding (high-speed mode)
-                    slipstream_dns::build_query_with_edns0_payload(
-                        &send_buf[..send_length],
-                        config.domain,
-                        dns_id,
-                    )
-                    .map_err(|err| ClientError::new(err.to_string()))?
-                };
+                let packet = build_transport_query(&send_buf[..send_length], config.domain, dns_id)
+                    .map_err(|err| ClientError::new(err.to_string()))?;
                 dns_id = dns_id.wrapping_add(1);
 
                 let dest = sockaddr_storage_to_socket_addr(&addr_to)?;

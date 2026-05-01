@@ -27,16 +27,47 @@ pub fn build_qname(payload: &[u8], domain: &str) -> Result<String, DnsError> {
     }
     let base32 = base32_encode(payload);
     let dotted = dotify(&base32);
-    Ok(format!("{}.{}.", dotted, domain))
+    let mut qname = String::with_capacity(dotted.len() + domain.len() + 2);
+    qname.push_str(&dotted);
+    qname.push('.');
+    qname.push_str(domain);
+    qname.push('.');
+    Ok(qname)
 }
 
 /// Maximum payload size for EDNS0 OPT record encoding
-/// EDNS0 UDP payload is 4096, DNS header ~12 bytes, question ~domain+8, OPT ~11 bytes
-/// Conservative limit accounting for domain name overhead
+/// EDNS0 UDP payload advertises 1232 bytes; this keeps the encoded DNS packet within
+/// a conservative size envelope for the transport.
 pub const MAX_EDNS0_PAYLOAD: usize = 1232;
+
+/// Maximum DNS packet size this transport emits when carrying EDNS0 OPT payloads.
+pub const MAX_DNS_PACKET_SIZE: usize = 12 + name::MAX_DNS_NAME_LEN + 4 + 11 + MAX_EDNS0_PAYLOAD;
 
 /// Threshold for automatically switching to EDNS0 encoding
 pub const EDNS0_THRESHOLD: usize = 200;
+
+pub fn build_transport_query(
+    payload: &[u8],
+    domain: &str,
+    query_id: u16,
+) -> Result<Vec<u8>, DnsError> {
+    if payload.len() <= EDNS0_THRESHOLD {
+        let qname = build_qname(payload, domain)?;
+        let params = QueryParams {
+            id: query_id,
+            qname: &qname,
+            qtype: RR_TXT,
+            qclass: CLASS_IN,
+            rd: true,
+            cd: false,
+            qdcount: 1,
+            is_query: true,
+        };
+        encode_query(&params)
+    } else {
+        build_query_with_edns0_payload(payload, domain, query_id)
+    }
+}
 
 /// Build a DNS query packet with payload encoded in EDNS0 OPT record
 /// This supports much larger payloads (~1232 bytes) than QNAME encoding (~140 bytes)

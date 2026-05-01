@@ -33,7 +33,6 @@ use crate::streams::{
 
 // Protocol defaults; see docs/config.md for details.
 const SLIPSTREAM_ALPN: &str = "picoquic_sample";
-const DNS_MAX_QUERY_SIZE: usize = 512;
 const IDLE_SLEEP_MS: u64 = 10;
 const IDLE_GC_INTERVAL: Duration = Duration::from_secs(1);
 // Default QUIC MTU for server packets; see docs/config.md for details.
@@ -275,7 +274,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
     let recv_buf_len = if fallback_mgr.is_some() {
         MAX_UDP_PACKET_SIZE
     } else {
-        DNS_MAX_QUERY_SIZE
+        slipstream_dns::MAX_DNS_PACKET_SIZE
     };
     let mut recv_buf = vec![0u8; recv_buf_len];
     let mut send_buf = vec![0u8; PICOQUIC_MAX_PACKET_SIZE];

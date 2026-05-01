@@ -41,6 +41,7 @@ Notes:
 - Resolver order follows the CLI; the first resolver becomes path 0.
 - Resolver addresses must be unique; duplicates are rejected.
 - --authoritative keeps the DNS wire format unchanged and remains C interop safe.
+- Authoritative-only resolver sets can use larger EDNS0-carried QUIC packets for better throughput; mixed and recursive sets stay on the conservative QNAME-derived MTU.
 - Use --authoritative only when you control the resolver/server path and can absorb high QPS bursts.
 - When --congestion-control is omitted, authoritative paths default to bbr and recursive paths default to dcubic.
 - Authoritative polling derives its QPS budget from picoquic’s pacing rate (scaled by the DNS payload size and RTT proxy) and falls back to cwnd if pacing is unavailable; `--debug-poll` logs the pacing rate, target QPS, and inflight polls.

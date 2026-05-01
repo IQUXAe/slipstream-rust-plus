@@ -37,6 +37,9 @@ certificates are not verified.
 
 - Client ALPN: `picoquic_sample` (must match server ALPN).
 - Client SNI: `test.example.com`.
+- Client QUIC MTU:
+  - Recursive/mixed resolver sets derive MTU from the domain's QNAME capacity.
+  - Authoritative-only resolver sets use an EDNS0 transport MTU up to `900`.
 - Server ALPN: `picoquic_sample`.
 - Server QUIC MTU: `900`.
   Update `crates/slipstream-client/src/client.rs` and `crates/slipstream-server/src/server.rs`

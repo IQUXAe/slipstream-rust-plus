@@ -67,14 +67,9 @@ pub fn decode_query_with_domains(
     // Check if payload is in EDNS0 OPT record (high-speed mode)
     if let Some(opt_payload) = try_extract_opt_payload(packet, &header) {
         // Verify the question matches one of our domains
-        let matches_domain = domains.iter().any(|domain| {
-            let domain_with_dot = if domain.ends_with('.') {
-                domain.to_string()
-            } else {
-                format!("{}.", domain)
-            };
-            question.name == domain_with_dot
-        });
+        let matches_domain = domains
+            .iter()
+            .any(|domain| matches_exact_domain(&question.name, domain));
 
         if !matches_domain {
             return Err(DecodeQueryError::Reply {
@@ -142,6 +137,12 @@ pub fn decode_query_with_domains(
     })
 }
 
+fn matches_exact_domain(qname: &str, domain: &str) -> bool {
+    let qname = qname.trim_end_matches('.');
+    let domain = domain.trim_end_matches('.');
+    !qname.is_empty() && !domain.is_empty() && qname.eq_ignore_ascii_case(domain)
+}
+
 /// Try to extract payload from EDNS0 OPT record
 /// Returns Some(payload) if found, None otherwise
 fn try_extract_opt_payload(packet: &[u8], header: &crate::wire::Header) -> Option<Vec<u8>> {
@@ -200,8 +201,8 @@ fn try_extract_opt_payload(packet: &[u8], header: &crate::wire::Header) -> Optio
             return None;
         }
 
-        // Check if this is an OPT record with root name
-        if rr_type == RR_OPT && name.is_empty() {
+        // OPT records use the root label as their owner name.
+        if rr_type == RR_OPT && rdlen > 0 && (name.is_empty() || name == ".") {
             // Extract the payload from RDATA
             let payload = packet[offset..offset + rdlen].to_vec();
             return Some(payload);

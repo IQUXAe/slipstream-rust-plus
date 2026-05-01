@@ -11,6 +11,7 @@
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test -p slipstream-dns`
 - `cargo test`
+- `./scripts/package_release.sh --version <tag>`
 
 ## Hygiene
 - Verify build outputs stay untracked: `.interop/`, `.picoquic-build/`, `target/`.
@@ -20,3 +21,5 @@
 ## Release
 - Tag the release and push tags.
 - Publish artifacts if applicable.
+- `./scripts/package_release.sh` writes `dist/<name>/` plus `dist/<name>.tar.gz` with:
+  `slipstream-client`, `slipstream-server`, `README.txt`, and `SHA256SUMS`.

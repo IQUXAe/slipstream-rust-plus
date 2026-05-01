@@ -113,7 +113,9 @@ Otherwise, the response is ignored (including NAME_ERROR, which signals no data)
 
 ## Limits and constraints
 
-- MAX_DNS_QUERY_SIZE is 512 bytes (traditional DNS UDP limit).
+- Legacy QNAME-encoded queries fit within the traditional 512-byte DNS UDP limit.
+- EDNS0 OPT payload queries may exceed 512 bytes; the Rust transport sizes its receive buffer
+  to accept the full encoded packet.
 - Inline dots ensure label length <= 57 chars.
 - EDNS0 is always included on outbound messages and advertises udp_payload=1232;
   incoming messages are accepted regardless of OPT presence.

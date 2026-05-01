@@ -1,23 +1,33 @@
 use crate::error::ClientError;
+use slipstream_dns::{max_payload_len_for_domain, MAX_EDNS0_PAYLOAD};
+use slipstream_ffi::ResolverMode;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use tokio::net::{lookup_host, TcpListener as TokioTcpListener, UdpSocket as TokioUdpSocket};
 use tracing::warn;
 
-#[allow(dead_code)]
-pub(crate) fn compute_mtu(domain_len: usize) -> Result<u32, ClientError> {
-    if domain_len >= 240 {
-        return Err(ClientError::new(
-            "Domain name is too long for DNS transport",
-        ));
-    }
-    let mtu = ((220.0 - domain_len as f64) / 1.6) as u32;
-    if mtu == 0 {
+pub(crate) const AUTHORITATIVE_EDNS0_MTU: u32 = 900;
+
+pub(crate) fn compute_transport_mtu(
+    domain: &str,
+    resolver_modes: &[ResolverMode],
+) -> Result<u32, ClientError> {
+    let qname_mtu =
+        max_payload_len_for_domain(domain).map_err(|err| ClientError::new(err.to_string()))? as u32;
+    if qname_mtu == 0 {
         return Err(ClientError::new(
             "MTU computed to zero; check domain length",
         ));
     }
-    Ok(mtu)
+    let authoritative_only = !resolver_modes.is_empty()
+        && resolver_modes
+            .iter()
+            .all(|mode| matches!(mode, ResolverMode::Authoritative));
+    if authoritative_only {
+        Ok(qname_mtu.max(AUTHORITATIVE_EDNS0_MTU.min(MAX_EDNS0_PAYLOAD as u32)))
+    } else {
+        Ok(qname_mtu)
+    }
 }
 
 pub(crate) async fn bind_udp_socket() -> Result<TokioUdpSocket, ClientError> {
@@ -97,4 +107,26 @@ fn bind_udp_socket_addr(addr: SocketAddr) -> Result<TokioUdpSocket, ClientError>
 
 pub(crate) fn map_io(err: std::io::Error) -> ClientError {
     ClientError::new(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_transport_mtu, AUTHORITATIVE_EDNS0_MTU};
+    use slipstream_ffi::ResolverMode;
+
+    #[test]
+    fn keeps_qname_mtu_for_recursive_paths() {
+        let mtu = compute_transport_mtu("example.com", &[ResolverMode::Recursive]).expect("mtu");
+        assert!(mtu < AUTHORITATIVE_EDNS0_MTU);
+    }
+
+    #[test]
+    fn upgrades_authoritative_only_paths_to_edns0_mtu() {
+        let mtu = compute_transport_mtu(
+            "example.com",
+            &[ResolverMode::Authoritative, ResolverMode::Authoritative],
+        )
+        .expect("mtu");
+        assert_eq!(mtu, AUTHORITATIVE_EDNS0_MTU);
+    }
 }
