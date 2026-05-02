@@ -64,6 +64,9 @@ pub(crate) fn add_paths(
         if resolver.added {
             continue;
         }
+        if !resolver.enabled {
+            continue;
+        }
         if resolver.next_probe_at > now {
             continue;
         }
