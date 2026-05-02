@@ -10,3 +10,6 @@ __pycache__/
 # Rust workspace artifacts
 /target/
 **/*.rs.bk
+dist
+cert.pem
+key.pem

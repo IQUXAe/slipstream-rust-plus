@@ -712,6 +712,17 @@ fn handle_stream_data(
             reset_stream = true;
         }
 
+        if debug_streams && !data.is_empty() {
+            debug!(
+                "stream {:?}: quic_recv chunk_len={} rx_bytes_total={} queued_bytes={} pending_chunks={}",
+                stream_id,
+                data.len(),
+                stream.flow.rx_bytes,
+                stream.flow.queued_bytes,
+                stream.pending_data.len()
+            );
+        }
+
         if fin {
             if stream.flow.discarding {
                 if !reset_stream {
@@ -1062,6 +1073,15 @@ pub(crate) fn handle_command(state_ptr: *mut ServerState, command: Command) {
                     return;
                 }
                 stream.flow.queued_bytes = stream.flow.queued_bytes.saturating_sub(bytes);
+                if state.debug_streams && bytes > 0 {
+                    debug!(
+                        "stream {:?}: target_drained bytes={} remaining_queued={} rx_bytes={}",
+                        stream_id,
+                        bytes,
+                        stream.flow.queued_bytes,
+                        stream.flow.rx_bytes
+                    );
+                }
                 if !state.multi_streams.contains(&cnx_id) {
                     let new_offset = reserve_target_offset(
                         stream.flow.rx_bytes,
