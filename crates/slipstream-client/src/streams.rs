@@ -1423,7 +1423,6 @@ pub(crate) fn handle_command(
             check_stream_invariants(state, stream_id, "NewStream");
         }
         Command::StreamData { stream_id, data } => {
-            let chunk_len = data.len();
             let ret =
                 unsafe { picoquic_add_to_stream(cnx, stream_id, data.as_ptr(), data.len(), 0) };
             if ret < 0 {
@@ -1431,23 +1430,17 @@ pub(crate) fn handle_command(
                     "stream {}: add_to_stream failed ret={} chunk_len={}",
                     stream_id,
                     ret,
-                    chunk_len
+                    data.len()
                 );
                 unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
                 state.mark_stream_removed(stream_id);
                 state.streams.remove(&stream_id);
             } else if let Some(stream) = state.streams.get_mut(&stream_id) {
-                stream.tx_bytes = stream.tx_bytes.saturating_add(chunk_len as u64);
+                stream.tx_bytes = stream.tx_bytes.saturating_add(data.len() as u64);
                 let now = unsafe { picoquic_current_time() };
                 state.debug_enqueued_bytes =
-                    state.debug_enqueued_bytes.saturating_add(chunk_len as u64);
+                    state.debug_enqueued_bytes.saturating_add(data.len() as u64);
                 state.debug_last_enqueue_at = now;
-                if state.debug_streams {
-                    debug!(
-                        "stream {}: quic_enqueue chunk_len={} tx_bytes_total={}",
-                        stream_id, chunk_len, stream.tx_bytes
-                    );
-                }
             }
             check_stream_invariants(state, stream_id, "StreamData");
         }
@@ -1459,11 +1452,6 @@ pub(crate) fn handle_command(
             if !should_send_fin {
                 return;
             }
-            let _pre_fin_tx_bytes = state
-                .streams
-                .get(&stream_id)
-                .map(|s| s.tx_bytes)
-                .unwrap_or(0);
             #[cfg(test)]
             let forced_failure = test_hooks::take_add_to_stream_failure();
             #[cfg(not(test))]
@@ -1492,19 +1480,7 @@ pub(crate) fn handle_command(
                 state.streams.remove(&stream_id);
             } else if let Some(stream) = state.streams.get_mut(&stream_id) {
                 stream.send_state = StreamSendState::FinQueued;
-                if state.debug_streams {
-                    debug!(
-                        "stream {}: fin_queued tx_bytes_total={} recv_state={:?} queued_bytes={}",
-                        stream_id, stream.tx_bytes, stream.recv_state, stream.flow.queued_bytes
-                    );
-                }
                 if stream.recv_state.is_closed() && stream.flow.queued_bytes == 0 {
-                    if state.debug_streams {
-                        debug!(
-                            "stream {}: fully_closed tx_bytes={} rx_bytes={}",
-                            stream_id, stream.tx_bytes, stream.flow.rx_bytes
-                        );
-                    }
                     state.mark_stream_removed(stream_id);
                     state.streams.remove(&stream_id);
                 }
