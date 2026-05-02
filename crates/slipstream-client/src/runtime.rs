@@ -54,6 +54,7 @@ const RECONNECT_SLEEP_MIN_MS: u64 = 1;
 const RECONNECT_SLEEP_MAX_MS: u64 = 5_000;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
 const STALL_TIMEOUT_US: u64 = 15_000_000;
+const PRIMARY_STALL_TIMEOUT_US: u64 = 5_000_000;
 
 fn is_ipv6_unspecified(host: &str) -> bool {
     host.parse::<Ipv6Addr>()
@@ -157,6 +158,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     let _state = state;
 
     let mut reconnect_delay = Duration::from_millis(RECONNECT_SLEEP_MIN_MS);
+    let mut preferred_primary_offset: usize = 0;
 
     loop {
         let mut resolvers = resolve_resolvers(
@@ -176,23 +178,37 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             config.public_fast_response_bytes,
         )
         .await?;
-        if let Some(primary_index) = resolvers.iter().position(|resolver| resolver.enabled) {
-            resolvers.swap(0, primary_index);
-            for (idx, resolver) in resolvers.iter_mut().enumerate() {
-                if idx == 0 {
-                    resolver.added = true;
-                    resolver.path_id = 0;
-                    resolver.unique_path_id = Some(0);
-                } else {
-                    resolver.added = false;
-                    resolver.path_id = -1;
-                    resolver.unique_path_id = None;
-                }
-            }
-        } else {
+        let enabled_indices: Vec<usize> = resolvers
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.enabled)
+            .map(|(i, _)| i)
+            .collect();
+        if enabled_indices.is_empty() {
             return Err(ClientError::new(
-                "No enabled resolver is available after the capability probe",
+                "No resolver passed the public TXT capability probe",
             ));
+        }
+        let primary_index = enabled_indices[preferred_primary_offset % enabled_indices.len()];
+        if primary_index != 0 {
+            resolvers.swap(0, primary_index);
+        }
+        info!(
+            "primary_resolver resolver={} rtt_ms={:?} (rotation_offset={})",
+            resolvers[0].addr,
+            resolvers[0].profile.rtt_ms,
+            preferred_primary_offset
+        );
+        for (idx, resolver) in resolvers.iter_mut().enumerate() {
+            if idx == 0 {
+                resolver.added = true;
+                resolver.path_id = 0;
+                resolver.unique_path_id = Some(0);
+            } else {
+                resolver.added = false;
+                resolver.path_id = -1;
+                resolver.unique_path_id = None;
+            }
         }
 
         let mut local_addr_storage = socket_addr_to_storage(udp.local_addr().map_err(map_io)?);
@@ -291,6 +307,8 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut last_flow_block_log_at = 0u64;
         let mut current_resolver_index = 0usize;
         let mut last_progress_us = unsafe { picoquic_current_time() };
+        let mut last_primary_dns_count: u64 = 0;
+        let mut last_primary_dns_check_at = unsafe { picoquic_current_time() };
 
         loop {
             let current_time = unsafe { picoquic_current_time() };
@@ -489,10 +507,11 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                             && current_time.saturating_sub(last_progress_us) >= STALL_TIMEOUT_US
                         {
                             warn!(
-                                "connection stalled for {}ms with {} active streams; reconnecting",
+                                "connection stalled for {}ms with {} active streams; rotating primary and reconnecting",
                                 current_time.saturating_sub(last_progress_us) / 1_000,
                                 streams_len
                             );
+                            preferred_primary_offset = preferred_primary_offset.wrapping_add(1);
                             break;
                         }
                     } else {
@@ -714,6 +733,30 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     resolver.last_pacing_snapshot,
                 );
             }
+
+            // Early stall detection: if primary resolver received zero DNS
+            // responses for PRIMARY_STALL_TIMEOUT_US, rotate and reconnect.
+            {
+                let now_us = unsafe { picoquic_current_time() };
+                let primary_dns_now = resolvers[0].debug.dns_responses;
+                if primary_dns_now != last_primary_dns_count {
+                    last_primary_dns_count = primary_dns_now;
+                    last_primary_dns_check_at = now_us;
+                } else if now_us.saturating_sub(last_primary_dns_check_at)
+                    >= PRIMARY_STALL_TIMEOUT_US
+                {
+                    let ready = unsafe { (*state_ptr).is_ready() };
+                    if !ready {
+                        warn!(
+                            "primary resolver {} silent for {}ms during handshake; rotating to next resolver",
+                            resolvers[0].addr,
+                            now_us.saturating_sub(last_primary_dns_check_at) / 1_000
+                        );
+                        preferred_primary_offset = preferred_primary_offset.wrapping_add(1);
+                        break;
+                    }
+                }
+            }
         }
 
         unsafe {
@@ -731,6 +774,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             "Connection closed; reconnecting in {}ms",
             reconnect_delay.as_millis()
         );
+        
+        // Rotate to the next resolver for the next connection attempt
+        preferred_primary_offset = preferred_primary_offset.wrapping_add(1);
+
         // Sleep in small chunks and drop commands that arrive while disconnected.
         let mut remaining_sleep = reconnect_delay;
         while remaining_sleep > Duration::ZERO {
