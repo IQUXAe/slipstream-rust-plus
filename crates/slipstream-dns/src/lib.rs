@@ -16,6 +16,12 @@ pub use types::{
     CLASS_IN, EDNS_UDP_PAYLOAD, RR_A, RR_OPT, RR_TXT,
 };
 
+pub const DNS_RESPONSE_TTL_PUBLIC: u32 = 0;
+pub const DEFAULT_PUBLIC_SAFE_RESPONSE_BYTES: usize = 360;
+pub const LEGACY_EDNS0_PAYLOAD_MAGIC: &[u8; 4] = b"SLP\x01";
+const PROBE_PREFIX: &str = "_slp-probe";
+const PROBE_MARKER: &[u8; 16] = b"slipstream-probe";
+
 pub fn build_qname(payload: &[u8], domain: &str) -> Result<String, DnsError> {
     let domain = domain.trim_end_matches('.');
     if domain.is_empty() {
@@ -28,6 +34,100 @@ pub fn build_qname(payload: &[u8], domain: &str) -> Result<String, DnsError> {
     let base32 = base32_encode(payload);
     let dotted = dotify(&base32);
     Ok(format!("{}.{}.", dotted, domain))
+}
+
+pub fn build_probe_qname(
+    domain: &str,
+    token: u16,
+    response_payload_len: usize,
+) -> Result<String, DnsError> {
+    let domain = domain.trim_end_matches('.');
+    if domain.is_empty() {
+        return Err(DnsError::new("domain must not be empty"));
+    }
+    let qname = format!(
+        "{}.{:04x}.{}.{}.",
+        PROBE_PREFIX, token, response_payload_len, domain
+    );
+    if qname.len() > name::MAX_DNS_NAME_LEN {
+        return Err(DnsError::new("probe qname too long"));
+    }
+    Ok(qname)
+}
+
+pub fn parse_probe_qname(qname: &str, domains: &[&str]) -> Option<(u16, usize)> {
+    let normalized = qname.trim_end_matches('.');
+    for domain in domains {
+        let domain = domain.trim_end_matches('.');
+        let suffix = format!(".{}", domain);
+        let head = normalized.strip_suffix(&suffix)?;
+        let mut parts = head.split('.');
+        if parts.next()? != PROBE_PREFIX {
+            continue;
+        }
+        let token = u16::from_str_radix(parts.next()?, 16).ok()?;
+        let response_payload_len = parts.next()?.parse::<usize>().ok()?;
+        if parts.next().is_some() {
+            continue;
+        }
+        return Some((token, response_payload_len));
+    }
+    None
+}
+
+pub fn build_probe_payload(token: u16, response_payload_len: usize) -> Result<Vec<u8>, DnsError> {
+    let min_len = PROBE_MARKER.len() + 2;
+    if response_payload_len < min_len {
+        return Err(DnsError::new("probe payload too small"));
+    }
+    let mut payload = Vec::with_capacity(response_payload_len);
+    payload.extend_from_slice(PROBE_MARKER);
+    payload.extend_from_slice(&token.to_be_bytes());
+    while payload.len() < response_payload_len {
+        payload.push(b'x');
+    }
+    Ok(payload)
+}
+
+pub fn validate_probe_payload(payload: &[u8], token: u16, response_payload_len: usize) -> bool {
+    payload.len() == response_payload_len
+        && payload.starts_with(PROBE_MARKER)
+        && payload.get(PROBE_MARKER.len()..PROBE_MARKER.len() + 2) == Some(&token.to_be_bytes())
+}
+
+pub fn estimate_query_size(qname: &str) -> Result<usize, DnsError> {
+    let params = QueryParams {
+        id: 0,
+        qname,
+        qtype: RR_TXT,
+        qclass: CLASS_IN,
+        rd: true,
+        cd: false,
+        qdcount: 1,
+        is_query: true,
+    };
+    Ok(encode_query(&params)?.len())
+}
+
+pub fn estimate_txt_response_size(
+    question_name: &str,
+    payload_len: usize,
+) -> Result<usize, DnsError> {
+    let question = Question {
+        name: question_name.to_string(),
+        qtype: RR_TXT,
+        qclass: CLASS_IN,
+    };
+    let payload = vec![0u8; payload_len];
+    let response = encode_response(&ResponseParams {
+        id: 0,
+        rd: true,
+        cd: false,
+        question: &question,
+        payload: Some(&payload),
+        rcode: None,
+    })?;
+    Ok(response.len())
 }
 
 /// Maximum payload size for EDNS0 OPT record encoding
@@ -133,10 +233,14 @@ fn encode_query_with_opt_payload(
     // TTL: extended RCODE and flags (4 bytes, all zeros)
     packet.extend_from_slice(&[0, 0, 0, 0]);
     // RDLENGTH: length of RDATA
-    let rdlen = opt_payload.len() as u16;
+    let mut legacy_payload =
+        Vec::with_capacity(LEGACY_EDNS0_PAYLOAD_MAGIC.len() + opt_payload.len());
+    legacy_payload.extend_from_slice(LEGACY_EDNS0_PAYLOAD_MAGIC);
+    legacy_payload.extend_from_slice(opt_payload);
+    let rdlen = legacy_payload.len() as u16;
     packet.extend_from_slice(&rdlen.to_be_bytes());
-    // RDATA: our payload
-    packet.extend_from_slice(opt_payload);
+    // RDATA: explicit legacy marker + payload so public-recursive QNAME decode can ignore OPT noise
+    packet.extend_from_slice(&legacy_payload);
 
     Ok(packet)
 }
@@ -144,7 +248,10 @@ fn encode_query_with_opt_payload(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_qname, build_query_with_edns0_payload, max_payload_len_for_domain, MAX_EDNS0_PAYLOAD,
+        build_probe_payload, build_probe_qname, build_qname, build_query_with_edns0_payload,
+        estimate_query_size, estimate_txt_response_size, max_payload_len_for_domain,
+        parse_probe_qname, validate_probe_payload, DEFAULT_PUBLIC_SAFE_RESPONSE_BYTES,
+        MAX_EDNS0_PAYLOAD,
     };
 
     #[test]
@@ -176,5 +283,37 @@ mod tests {
         let payload = vec![0xAB; MAX_EDNS0_PAYLOAD + 1];
         let result = build_query_with_edns0_payload(&payload, domain, 0x1234);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn probe_qname_round_trips() {
+        let qname = build_probe_qname("example.com", 0x1234, 360).expect("probe qname");
+        assert_eq!(
+            parse_probe_qname(&qname, &["example.com"]),
+            Some((0x1234, 360))
+        );
+    }
+
+    #[test]
+    fn probe_payload_round_trips() {
+        let payload = build_probe_payload(0x1234, 48).expect("probe payload");
+        assert!(validate_probe_payload(&payload, 0x1234, 48));
+    }
+
+    #[test]
+    fn estimators_return_non_zero_sizes() {
+        let query_size = estimate_query_size("a.example.com.").expect("query size");
+        let response_size =
+            estimate_txt_response_size("a.example.com.", 64).expect("response size");
+        assert!(query_size > 0);
+        assert!(response_size > 0);
+    }
+
+    #[test]
+    fn default_public_safe_response_fits_512_bytes() {
+        let response_size =
+            estimate_txt_response_size("a.example.com.", DEFAULT_PUBLIC_SAFE_RESPONSE_BYTES)
+                .expect("response size");
+        assert!(response_size <= 512, "response size was {}", response_size);
     }
 }

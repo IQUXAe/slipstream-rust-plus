@@ -7,7 +7,7 @@ use self::path::{
 };
 use self::setup::{bind_tcp_listener, bind_udp_socket, map_io};
 use crate::dns::{
-    add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
+    add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug, probe_resolvers,
     refresh_resolver_path, resolve_resolvers, resolver_mode_to_c, send_poll_queries,
     sockaddr_storage_to_socket_addr, DnsResponseContext,
 };
@@ -19,7 +19,10 @@ use crate::streams::{
     ClientState, Command,
 };
 use slipstream_core::{net::is_transient_udp_error, normalize_dual_stack_addr};
-use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_TXT};
+use slipstream_dns::{
+    build_qname, build_query_with_edns0_payload, encode_query, estimate_query_size,
+    max_payload_len_for_domain, QueryParams, CLASS_IN, RR_TXT,
+};
 use slipstream_ffi::{
     configure_quic_with_custom,
     picoquic::{
@@ -31,7 +34,8 @@ use slipstream_ffi::{
         slipstream_set_default_path_mode, PICOQUIC_MAX_PACKET_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX,
         PICOQUIC_PACKET_LOOP_SEND_MAX,
     },
-    socket_addr_to_storage, take_crypto_errors, ClientConfig, QuicGuard, ResolverMode,
+    socket_addr_to_storage, take_crypto_errors, ClientConfig, DnsTransportMode, QuicGuard,
+    ResolverMode,
 };
 use std::ffi::CString;
 use std::net::Ipv6Addr;
@@ -69,9 +73,33 @@ fn drain_disconnected_commands(command_rx: &mut mpsc::UnboundedReceiver<Command>
 }
 
 pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
-    let mtu = slipstream_dns::max_payload_len_for_domain(config.domain)
-        .map_err(|err| ClientError::new(err.to_string()))? as u32;
+    let max_qname_payload = max_payload_len_for_domain(config.domain)
+        .map_err(|err| ClientError::new(err.to_string()))?;
+    let max_query_qname = build_qname(&vec![0u8; max_qname_payload], config.domain)
+        .map_err(|err| ClientError::new(err.to_string()))?;
+    let expected_query_size =
+        estimate_query_size(&max_query_qname).map_err(|err| ClientError::new(err.to_string()))?;
+    let mtu = match config.transport_mode {
+        DnsTransportMode::PublicRecursiveQname => max_qname_payload as u32,
+        DnsTransportMode::LegacyEdns0Payload => config
+            .public_fast_response_bytes
+            .unwrap_or(config.public_safe_response_bytes)
+            as u32,
+    };
     let udp = bind_udp_socket().await?;
+    info!(
+        "public_dns_startup domain={} effective_qname_payload_bytes={} expected_dns_query_size={} selected_public_dns_mode={:?} cert_pinning={} public_safe_response_bytes={} public_fast_response_bytes={}",
+        config.domain,
+        max_qname_payload,
+        expected_query_size,
+        config.transport_mode,
+        if config.cert.is_some() { "pinned" } else { "insecure-no-pin" },
+        config.public_safe_response_bytes,
+        config
+            .public_fast_response_bytes
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "disabled".to_string())
+    );
 
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let data_notify = Arc::new(Notify::new());
@@ -131,9 +159,40 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     let mut reconnect_delay = Duration::from_millis(RECONNECT_SLEEP_MIN_MS);
 
     loop {
-        let mut resolvers = resolve_resolvers(config.resolvers, mtu, config.debug_poll)?;
+        let mut resolvers = resolve_resolvers(
+            config.resolvers,
+            mtu,
+            config.debug_poll,
+            config.transport_mode,
+        )?;
         if resolvers.is_empty() {
             return Err(ClientError::new("At least one resolver is required"));
+        }
+        probe_resolvers(
+            &udp,
+            &mut resolvers,
+            config.domain,
+            config.public_safe_response_bytes,
+            config.public_fast_response_bytes,
+        )
+        .await?;
+        if let Some(primary_index) = resolvers.iter().position(|resolver| resolver.enabled) {
+            resolvers.swap(0, primary_index);
+            for (idx, resolver) in resolvers.iter_mut().enumerate() {
+                if idx == 0 {
+                    resolver.added = true;
+                    resolver.path_id = 0;
+                    resolver.unique_path_id = Some(0);
+                } else {
+                    resolver.added = false;
+                    resolver.path_id = -1;
+                    resolver.unique_path_id = None;
+                }
+            }
+        } else {
+            return Err(ClientError::new(
+                "No enabled resolver is available after the capability probe",
+            ));
         }
 
         let mut local_addr_storage = socket_addr_to_storage(udp.local_addr().map_err(map_io)?);
@@ -274,6 +333,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 if !refresh_resolver_path(cnx, resolver) {
                     continue;
                 }
+                if !resolver.enabled {
+                    continue;
+                }
                 let pending_for_sleep = match resolver.mode {
                     ResolverMode::Authoritative => {
                         let quality = fetch_path_quality(cnx, resolver);
@@ -371,7 +433,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     let resolver = &mut resolvers[idx];
 
                     // Skip if path is not yet established (path_id < 0)
-                    if resolver.path_id < 0 {
+                    if !resolver.enabled || resolver.path_id < 0 {
                         continue;
                     }
 
@@ -456,29 +518,28 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 // Adaptive MTU: Choose encoding based on packet size
                 // Small packets (<= 200 bytes): Use QNAME encoding (resilient mode)
                 // Large packets (> 200 bytes): Use EDNS0 OPT encoding (high-speed mode)
-                let packet = if send_length <= slipstream_dns::EDNS0_THRESHOLD {
-                    // QNAME encoding (legacy/resilient mode)
-                    let qname = build_qname(&send_buf[..send_length], config.domain)
-                        .map_err(|err| ClientError::new(err.to_string()))?;
-                    let params = QueryParams {
-                        id: dns_id,
-                        qname: &qname,
-                        qtype: RR_TXT,
-                        qclass: CLASS_IN,
-                        rd: true,
-                        cd: false,
-                        qdcount: 1,
-                        is_query: true,
-                    };
-                    encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?
-                } else {
-                    // EDNS0 OPT encoding (high-speed mode)
-                    slipstream_dns::build_query_with_edns0_payload(
+                let packet = match config.transport_mode {
+                    DnsTransportMode::PublicRecursiveQname => {
+                        let qname = build_qname(&send_buf[..send_length], config.domain)
+                            .map_err(|err| ClientError::new(err.to_string()))?;
+                        let params = QueryParams {
+                            id: dns_id,
+                            qname: &qname,
+                            qtype: RR_TXT,
+                            qclass: CLASS_IN,
+                            rd: true,
+                            cd: false,
+                            qdcount: 1,
+                            is_query: true,
+                        };
+                        encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?
+                    }
+                    DnsTransportMode::LegacyEdns0Payload => build_query_with_edns0_payload(
                         &send_buf[..send_length],
                         config.domain,
                         dns_id,
                     )
-                    .map_err(|err| ClientError::new(err.to_string()))?
+                    .map_err(|err| ClientError::new(err.to_string()))?,
                 };
                 dns_id = dns_id.wrapping_add(1);
 
@@ -529,6 +590,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             }
             for resolver in resolvers.iter_mut() {
                 if !refresh_resolver_path(cnx, resolver) {
+                    continue;
+                }
+                if !resolver.enabled {
                     continue;
                 }
                 match resolver.mode {
@@ -621,6 +685,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 resolver.debug.zero_send_loops = zero_send_loops;
                 resolver.debug.zero_send_with_streams = zero_send_with_streams;
                 if !refresh_resolver_path(cnx, resolver) {
+                    continue;
+                }
+                if !resolver.enabled {
                     continue;
                 }
                 let inflight_polls = resolver.inflight_poll_ids.len();

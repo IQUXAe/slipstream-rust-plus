@@ -246,7 +246,7 @@ static int encode_response_packet(uint16_t id, const dns_question_t *question, b
         answer_txt.name = question->name;
         answer_txt.type = question->type;
         answer_txt.class = question->class;
-        answer_txt.ttl = 60;
+        answer_txt.ttl = 0;
         answer_txt.text = (char *)payload;
         answer_txt.len = payload_len;
 

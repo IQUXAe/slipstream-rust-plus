@@ -73,6 +73,24 @@ pub fn normalize_domain(input: &str) -> Result<String, ConfigError> {
     if without_dot.is_empty() {
         return Err(ConfigError::new("Domain must not be empty"));
     }
+    if !without_dot.is_ascii() {
+        return Err(ConfigError::new(
+            "Domain must be ASCII or pre-encoded punycode",
+        ));
+    }
+    if without_dot.len() > 253 {
+        return Err(ConfigError::new("Domain must be 253 bytes or shorter"));
+    }
+    for label in without_dot.split('.') {
+        if label.is_empty() {
+            return Err(ConfigError::new("Domain labels must not be empty"));
+        }
+        if label.len() > 63 {
+            return Err(ConfigError::new(
+                "Domain labels must be 63 bytes or shorter",
+            ));
+        }
+    }
     Ok(without_dot.to_string())
 }
 

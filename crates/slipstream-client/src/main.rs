@@ -9,7 +9,8 @@ use clap::{parser::ValueSource, ArgGroup, CommandFactory, FromArgMatches, Parser
 use slipstream_core::{
     normalize_domain, parse_host_port, parse_host_port_parts, sip003, AddressKind, HostPort,
 };
-use slipstream_ffi::{ClientConfig, ResolverMode, ResolverSpec};
+use slipstream_dns::DEFAULT_PUBLIC_SAFE_RESPONSE_BYTES;
+use slipstream_ffi::{ClientConfig, DnsTransportMode, ResolverMode, ResolverSpec};
 use tokio::runtime::Builder;
 use tracing_subscriber::EnvFilter;
 
@@ -38,8 +39,14 @@ struct Args {
         value_parser = ["bbr", "dcubic"]
     )]
     congestion_control: Option<String>,
-    #[arg(long = "authoritative", value_parser = parse_resolver)]
+    #[arg(long = "dev-authoritative", alias = "authoritative", value_parser = parse_resolver)]
     authoritative: Vec<HostPort>,
+    #[arg(
+        long = "transport",
+        value_enum,
+        default_value_t = TransportArg::PublicRecursiveQname
+    )]
+    transport: TransportArg,
     #[arg(
         short = 'g',
         long = "gso",
@@ -52,14 +59,43 @@ struct Args {
     domain: Option<String>,
     #[arg(long = "cert", value_name = "PATH")]
     cert: Option<String>,
+    #[arg(long = "insecure-no-pin")]
+    insecure_no_pin: bool,
     #[arg(long = "keep-alive-interval", short = 't', default_value_t = 400)]
     keep_alive_interval: u16,
+    #[arg(
+        long = "public-safe-response-bytes",
+        default_value_t = DEFAULT_PUBLIC_SAFE_RESPONSE_BYTES
+    )]
+    public_safe_response_bytes: usize,
+    #[arg(long = "public-fast-response-bytes")]
+    public_fast_response_bytes: Option<usize>,
     #[arg(long = "debug")]
     debug: bool,
     #[arg(long = "debug-poll")]
     debug_poll: bool,
     #[arg(long = "debug-streams")]
     debug_streams: bool,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum TransportArg {
+    PublicRecursiveQname,
+    LegacyEdns0Payload,
+}
+
+impl TransportArg {
+    fn as_transport_mode(self) -> DnsTransportMode {
+        match self {
+            Self::PublicRecursiveQname => DnsTransportMode::PublicRecursiveQname,
+            Self::LegacyEdns0Payload => DnsTransportMode::LegacyEdns0Payload,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SecurityConfig {
+    cert: Option<String>,
 }
 
 fn main() {
@@ -164,11 +200,18 @@ fn main() {
     } else {
         sip003::last_option_value(&sip003_env.plugin_options, "cert")
     };
-    if cert.is_none() {
-        tracing::warn!(
-            "Server certificate pinning is disabled; this allows MITM. Provide --cert to pin the server leaf, or dismiss this if your underlying tunnel provides authentication."
-        );
-    }
+    let security = validate_security_config(cert, args.insecure_no_pin).unwrap_or_else(|err| {
+        tracing::error!("{}", err);
+        std::process::exit(2);
+    });
+    let public_fast_response_bytes = validate_response_sizes(
+        args.public_safe_response_bytes,
+        args.public_fast_response_bytes,
+    )
+    .unwrap_or_else(|err| {
+        tracing::error!("{}", err);
+        std::process::exit(2);
+    });
 
     let keep_alive_interval = if cli_provided(&matches, "keep_alive_interval") {
         args.keep_alive_interval
@@ -188,8 +231,11 @@ fn main() {
         congestion_control: congestion_control.as_deref(),
         gso: args.gso,
         domain: &domain,
-        cert: cert.as_deref(),
+        cert: security.cert.as_deref(),
+        transport_mode: args.transport.as_transport_mode(),
         keep_alive_interval: keep_alive_interval as usize,
+        public_safe_response_bytes: args.public_safe_response_bytes,
+        public_fast_response_bytes,
         debug_poll: args.debug_poll,
         debug_streams: args.debug_streams,
     };
@@ -235,6 +281,42 @@ fn parse_domain(input: &str) -> Result<String, String> {
 
 fn parse_resolver(input: &str) -> Result<HostPort, String> {
     parse_host_port(input, 53, AddressKind::Resolver).map_err(|err| err.to_string())
+}
+
+fn validate_security_config(
+    cert: Option<String>,
+    insecure_no_pin: bool,
+) -> Result<SecurityConfig, String> {
+    if cert.is_none() && !insecure_no_pin {
+        return Err(
+            "Server certificate pinning is required by default; provide --cert PATH or use --insecure-no-pin for dev/test only".to_string(),
+        );
+    }
+    if cert.is_some() && insecure_no_pin {
+        return Err("Use either --cert or --insecure-no-pin, not both".to_string());
+    }
+    Ok(SecurityConfig { cert })
+}
+
+fn validate_response_sizes(
+    public_safe_response_bytes: usize,
+    public_fast_response_bytes: Option<usize>,
+) -> Result<Option<usize>, String> {
+    if public_safe_response_bytes == 0 {
+        return Err("public-safe-response-bytes must be at least 1".to_string());
+    }
+    if let Some(public_fast_response_bytes) = public_fast_response_bytes {
+        if public_fast_response_bytes < public_safe_response_bytes {
+            return Err(
+                "public-fast-response-bytes must be greater than or equal to public-safe-response-bytes"
+                    .to_string(),
+            );
+        }
+        if public_fast_response_bytes == 0 {
+            return Err("public-fast-response-bytes must be at least 1".to_string());
+        }
+    }
+    Ok(public_fast_response_bytes)
 }
 
 fn build_resolvers(matches: &clap::ArgMatches, require: bool) -> Result<Vec<ResolverSpec>, String> {
@@ -391,7 +473,7 @@ mod tests {
                 "example.com",
                 "--resolver",
                 "1.1.1.1",
-                "--authoritative",
+                "--dev-authoritative",
                 "2.2.2.2",
                 "--resolver",
                 "3.3.3.3:5353",
@@ -415,7 +497,7 @@ mod tests {
                 "slipstream-client",
                 "--domain",
                 "example.com",
-                "--authoritative",
+                "--dev-authoritative",
                 "8.8.8.8",
                 "--resolver",
                 "9.9.9.9",
@@ -502,5 +584,31 @@ mod tests {
         let parsed = parse_resolvers_from_options(&options).expect("options should parse");
         assert!(parsed.resolvers.is_empty());
         assert!(parsed.authoritative_remote);
+    }
+
+    #[test]
+    fn cert_required_by_default() {
+        let err = validate_security_config(None, false).expect_err("missing cert should fail");
+        assert!(err.contains("certificate pinning is required"));
+    }
+
+    #[test]
+    fn insecure_no_pin_allows_missing_cert() {
+        let config = validate_security_config(None, true)
+            .expect("insecure-no-pin should allow missing cert");
+        assert!(config.cert.is_none());
+    }
+
+    #[test]
+    fn cert_and_insecure_no_pin_conflict() {
+        let err = validate_security_config(Some("cert.pem".to_string()), true)
+            .expect_err("conflicting flags should fail");
+        assert!(err.contains("either --cert or --insecure-no-pin"));
+    }
+
+    #[test]
+    fn transport_defaults_to_public_recursive_qname() {
+        let args = Args::try_parse_from(["slipstream-client", "--domain", "example.com"]).unwrap();
+        assert_eq!(args.transport, TransportArg::PublicRecursiveQname);
     }
 }

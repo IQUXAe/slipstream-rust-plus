@@ -16,6 +16,12 @@ pub enum ResolverMode {
     Authoritative = 2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsTransportMode {
+    PublicRecursiveQname,
+    LegacyEdns0Payload,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolverSpec {
     pub resolver: HostPort,
@@ -29,9 +35,12 @@ pub struct ClientConfig<'a> {
     pub resolvers: &'a [ResolverSpec],
     pub domain: &'a str,
     pub cert: Option<&'a str>,
+    pub transport_mode: DnsTransportMode,
     pub congestion_control: Option<&'a str>,
     pub gso: bool,
     pub keep_alive_interval: usize,
+    pub public_safe_response_bytes: usize,
+    pub public_fast_response_bytes: Option<usize>,
     pub debug_poll: bool,
     pub debug_streams: bool,
 }

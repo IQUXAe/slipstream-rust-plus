@@ -1,12 +1,21 @@
 use crate::error::ClientError;
 use crate::pacing::{PacingBudgetSnapshot, PacingPollBudget};
 use slipstream_core::{normalize_dual_stack_addr, resolve_host_port};
-use slipstream_ffi::{socket_addr_to_storage, ResolverMode, ResolverSpec};
+use slipstream_ffi::{socket_addr_to_storage, DnsTransportMode, ResolverMode, ResolverSpec};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tracing::warn;
 
 use super::debug::DebugMetrics;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResolverProfile {
+    pub(crate) supports_basic_txt: bool,
+    pub(crate) max_response_payload_observed: usize,
+    pub(crate) rtt_ms: Option<u64>,
+    pub(crate) timeout_rate: f32,
+    pub(crate) last_error: Option<String>,
+}
 
 pub(crate) struct ResolverState {
     pub(crate) addr: SocketAddr,
@@ -22,6 +31,9 @@ pub(crate) struct ResolverState {
     pub(crate) inflight_poll_ids: HashMap<u16, u64>,
     pub(crate) pacing_budget: Option<PacingPollBudget>,
     pub(crate) last_pacing_snapshot: Option<PacingBudgetSnapshot>,
+    pub(crate) enabled: bool,
+    pub(crate) transport_mode: DnsTransportMode,
+    pub(crate) profile: ResolverProfile,
     pub(crate) debug: DebugMetrics,
 }
 
@@ -38,6 +50,7 @@ pub(crate) fn resolve_resolvers(
     resolvers: &[ResolverSpec],
     mtu: u32,
     debug_poll: bool,
+    transport_mode: DnsTransportMode,
 ) -> Result<Vec<ResolverState>, ClientError> {
     let mut resolved = Vec::with_capacity(resolvers.len());
     let mut seen = HashMap::new();
@@ -70,6 +83,9 @@ pub(crate) fn resolve_resolvers(
                 ResolverMode::Recursive => None,
             },
             last_pacing_snapshot: None,
+            enabled: true,
+            transport_mode,
+            profile: ResolverProfile::default(),
             debug: DebugMetrics::new(debug_poll),
         });
     }
@@ -102,7 +118,7 @@ pub(crate) fn sockaddr_storage_to_socket_addr(
 mod tests {
     use super::resolve_resolvers;
     use slipstream_core::{AddressFamily, HostPort};
-    use slipstream_ffi::{ResolverMode, ResolverSpec};
+    use slipstream_ffi::{DnsTransportMode, ResolverMode, ResolverSpec};
 
     #[test]
     fn rejects_duplicate_resolver_addr() {
@@ -125,7 +141,12 @@ mod tests {
             },
         ];
 
-        match resolve_resolvers(&resolvers, 900, false) {
+        match resolve_resolvers(
+            &resolvers,
+            900,
+            false,
+            DnsTransportMode::PublicRecursiveQname,
+        ) {
             Ok(_) => panic!("expected duplicate resolver error"),
             Err(err) => assert!(err.to_string().contains("Duplicate resolver address")),
         }

@@ -1,5 +1,7 @@
 use slipstream_core::{net::is_transient_udp_error, normalize_dual_stack_addr};
-use slipstream_dns::{decode_query_with_domains, DecodeQueryError};
+use slipstream_dns::{
+    build_probe_payload, decode_query_with_domains, parse_probe_qname, DecodeQueryError, Question,
+};
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_incoming_packet_ex, picoquic_quic_t, slipstream_disable_ack_delay,
 };
@@ -13,6 +15,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::server::{map_io, ServerError, Slot};
+use slipstream_dns::RR_TXT;
 
 pub(crate) const MAX_UDP_PACKET_SIZE: usize = 65535;
 const FALLBACK_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -321,6 +324,10 @@ fn decode_slot(
     current_time: u64,
     local_addr_storage: &libc::sockaddr_storage,
 ) -> Result<DecodeSlotOutcome, ServerError> {
+    if let Some(slot) = decode_probe_slot(packet, peer, domains)? {
+        return Ok(DecodeSlotOutcome::Slot(slot));
+    }
+
     match decode_query_with_domains(packet, domains) {
         Ok(query) => {
             let mut peer_storage = dummy_sockaddr_storage();
@@ -404,6 +411,84 @@ fn decode_slot(
             }))
         }
     }
+}
+
+fn decode_probe_slot(
+    packet: &[u8],
+    peer: SocketAddr,
+    domains: &[&str],
+) -> Result<Option<Slot>, ServerError> {
+    let (id, rd, cd, question) = match parse_txt_question(packet)? {
+        Some(parsed) => parsed,
+        None => return Ok(None),
+    };
+    let Some((token, response_payload_len)) = parse_probe_qname(&question.name, domains) else {
+        return Ok(None);
+    };
+    let payload = build_probe_payload(token, response_payload_len)
+        .map_err(|err| ServerError::new(err.to_string()))?;
+    Ok(Some(Slot {
+        peer,
+        id,
+        rd,
+        cd,
+        question,
+        rcode: None,
+        cnx: std::ptr::null_mut(),
+        path_id: -1,
+        payload_override: Some(payload),
+    }))
+}
+
+fn parse_txt_question(packet: &[u8]) -> Result<Option<(u16, bool, bool, Question)>, ServerError> {
+    if packet.len() < 12 {
+        return Ok(None);
+    }
+    let id = u16::from_be_bytes([packet[0], packet[1]]);
+    let flags = u16::from_be_bytes([packet[2], packet[3]]);
+    let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
+    if flags & 0x8000 != 0 || qdcount != 1 {
+        return Ok(None);
+    }
+
+    let mut offset = 12usize;
+    let mut labels = Vec::new();
+    while offset < packet.len() {
+        let len = packet[offset] as usize;
+        offset += 1;
+        if len == 0 {
+            break;
+        }
+        if offset + len > packet.len() {
+            return Err(ServerError::new("Malformed DNS question"));
+        }
+        let label = std::str::from_utf8(&packet[offset..offset + len])
+            .map_err(|_| ServerError::new("Probe qname must be ASCII"))?;
+        labels.push(label.to_string());
+        offset += len;
+    }
+    if offset + 4 > packet.len() {
+        return Err(ServerError::new("Truncated DNS question"));
+    }
+    let qtype = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+    offset += 2;
+    let qclass = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+    if qtype != RR_TXT {
+        return Ok(None);
+    }
+
+    let question = Question {
+        name: format!("{}.", labels.join(".")),
+        qtype,
+        qclass,
+    };
+
+    Ok(Some((
+        id,
+        flags & 0x0100 != 0,
+        flags & 0x0010 != 0,
+        question,
+    )))
 }
 
 fn fallback_bind_addr(fallback_addr: SocketAddr) -> SocketAddr {

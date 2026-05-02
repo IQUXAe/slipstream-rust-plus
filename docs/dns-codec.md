@@ -8,7 +8,10 @@ This document captures the DNS codec behavior and how it is validated.
 - Inline dots: insert '.' every 57 characters from the right, never add a trailing dot.
 - QNAME format: <base32(payload) with inline dots>.<domain>.
 - Servers may be configured with multiple domains; the QNAME suffix must match one.
-- DNS query: QTYPE=TXT, QCLASS=IN, RD=1, EDNS0 OPT always included.
+- DNS query: QTYPE=TXT, QCLASS=IN, RD=1, EDNS0 OPT included only as a normal UDP size advertisement.
+- Public default path decodes payload from QNAME first.
+- Arbitrary OPT records from public resolvers must not break QNAME payload decode.
+- Legacy EDNS0 OPT payload is accepted only with an explicit magic marker and exact domain qname.
 - Server decode rules:
   - QR=1 or QDCOUNT!=1 -> FORMAT_ERROR.
   - QTYPE!=TXT -> NAME_ERROR.
@@ -51,6 +54,7 @@ This validates query/response encoding, error behavior, and raw packet drop case
 The Rust CLI enforces the following constraints:
 
 - Client requires --domain and at least one --resolver.
+- Client requires --cert by default unless --insecure-no-pin is passed explicitly.
 - Resolver parsing supports IPv4, bracketed IPv6, and optional :port.
 - Resolver lists may mix IPv4 and IPv6 entries.
 - Server requires at least one --domain (repeatable); --target-address defaults to 127.0.0.1:5201.

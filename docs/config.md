@@ -22,13 +22,14 @@ for real deployments. If the configured cert/key paths do not exist, the
 server auto-generates an ECDSA P-256 self-signed certificate (1000-year
 validity) and writes the key with 0600 permissions. The client can pass
 `--cert` to pin the server leaf certificate (PEM); CA bundles are not
-supported and the PEM must contain a single certificate. If omitted, server
-certificates are not verified.
+supported and the PEM must contain a single certificate. Certificate pinning is
+required by default; the only bypass is `--insecure-no-pin`, which exists for
+local development and tests.
 
 ## Logging and debug knobs
 
 - Logging uses `tracing` with `RUST_LOG` (default `info`). Example:
-  `RUST_LOG=debug cargo run -p slipstream-client -- --resolver=IP:PORT --domain=example.com`.
+  `RUST_LOG=debug cargo run -p slipstream-client -- --resolver=IP:PORT --domain=example.com --cert=cert.pem`.
 - `--debug-poll` (client) enables periodic poll/pacing metrics.
 - `--debug-streams` (client/server) logs stream lifecycle details.
 - `--debug-commands` (server) reports command counts once per second.
@@ -38,7 +39,8 @@ certificates are not verified.
 - Client ALPN: `picoquic_sample` (must match server ALPN).
 - Client SNI: `test.example.com`.
 - Server ALPN: `picoquic_sample`.
-- Server QUIC MTU: `900`.
+- Public-safe response ceiling: `360` bytes by default.
+- Public-fast response ceiling: disabled by default; enable only together with resolver probing.
   Update `crates/slipstream-client/src/client.rs` and `crates/slipstream-server/src/server.rs`
   together to keep client/server ALPN in sync.
 
@@ -49,6 +51,10 @@ certificates are not verified.
 - `--idle-timeout-seconds`
   Closes idle QUIC connections after the given number of seconds (default: 1200).
   Set to 0 to disable idle GC.
+- `--public-safe-response-bytes`
+  Caps the default public TXT payload size so responses stay in a conservative DNS envelope.
+- `--public-fast-response-bytes`
+  Optional larger TXT payload size for deployments that have already confirmed resolver support.
 - `--reset-seed`
   Path to a 32-hex-char (16-byte) stateless reset seed. If the file does not
   exist, the server generates one and writes it with 0600 permissions. If not

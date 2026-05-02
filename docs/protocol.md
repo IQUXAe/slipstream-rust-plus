@@ -1,7 +1,7 @@
 # Protocol
 
 Slipstream encapsulates QUIC packets inside DNS TXT queries and responses. The DNS
-codec is intentionally minimal and focused on speed and compatibility.
+codec is intentionally minimal and focused on public recursive compatibility.
 
 ## Domain suffix
 
@@ -26,11 +26,14 @@ codec is intentionally minimal and focused on speed and compatibility.
 - ARCOUNT: 1 with EDNS0 OPT record:
   - name: "."
   - type: RR_OPT (41)
-  - class: 65535
+  - class: 1232
   - ttl: 0
   - udp_payload: 1232
 - RD is set. Other flags default.
 - ID is a 16-bit value (random in C; any 16-bit value is valid for interop).
+- In the default public-recursive mode, tunnel payload lives only in QNAME.
+- Public resolvers may add or rewrite OPT details; OPT must not be used as the payload carrier in the public path.
+- A legacy EDNS0 payload mode may exist for tests/dev only, but it must use an explicit marker and exact qname matching.
 
 ## DNS response format (server -> client)
 
@@ -50,7 +53,7 @@ codec is intentionally minimal and focused on speed and compatibility.
     - name = query QNAME
     - type = TXT
     - class = query class
-    - ttl = 60
+    - ttl = 0
     - text = raw payload bytes (no base32)
 - If payload length == 0 and no error:
   - RCODE = NAME_ERROR (NXDOMAIN)
@@ -61,7 +64,7 @@ codec is intentionally minimal and focused on speed and compatibility.
 - If the DNS message is not a query (QR=1): respond with FORMAT_ERROR.
 - If QDCOUNT != 1: respond with FORMAT_ERROR.
 - If QTYPE != TXT: respond with NAME_ERROR (ignore query).
-- If the QNAME subdomain is empty: respond with NAME_ERROR.
+- If the QNAME subdomain is empty: respond with NAME_ERROR unless a legacy exact-domain OPT payload with explicit marker is in use.
 - If base32 decode fails: respond with SERVER_FAILURE.
 - If the DNS parser fails (decode error): drop the message (no response).
 - The server must verify that QNAME ends with a configured domain suffix; if not, respond with NAME_ERROR.
@@ -115,10 +118,12 @@ Otherwise, the response is ignored (including NAME_ERROR, which signals no data)
 
 - MAX_DNS_QUERY_SIZE is 512 bytes (traditional DNS UDP limit).
 - Inline dots ensure label length <= 57 chars.
-- EDNS0 is always included on outbound messages and advertises udp_payload=1232;
-  incoming messages are accepted regardless of OPT presence.
+- EDNS0 is included on outbound messages only as a standard UDP size advertisement;
+  it is not the payload carrier in the public default path.
+- Public-safe mode targets TXT responses that fit inside classic 512-byte UDP DNS responses.
+- Public-fast mode uses larger TXT responses only when the resolver probe has confirmed they work.
 - Client MTU is derived from the domain length: floor((240 - domain_len) / 1.6).
-- Server MTU is fixed at 900.
+- Server response size defaults to the configured public-safe ceiling and can be raised only for explicit public-fast deployments.
 
 ## References
 

@@ -1,91 +1,33 @@
-# 🚀 Slipstream Rust Plus
+# Slipstream Rust Plus
 
-![License](https://img.shields.io/badge/License-GPLv3-blue.svg) ![Build Status](https://img.shields.io/badge/Build-Passing-brightgreen.svg) ![Version](https://img.shields.io/badge/Version-1.0.0-orange.svg)
+Slipstream Rust Plus tunnels QUIC over DNS with a public-recursive-first design.
+The default mode is built for reachability through public DNS resolvers and
+prioritizes compatibility and anti-blocking behavior over peak throughput.
 
-[🇮🇷 **فارسی (Persian)**](README_FA.md) | [🤝 **Contributing**](CONTRIBUTING.md) | [🐛 **Report Bug**](SUPPORT.md)
+## Default transport
 
-**The Ultimate Anti-Censorship DNS Tunnel.**  
-*Bypass strict firewalls and enjoy high-speed internet using the power of QUIC over DNS.*
+- Default client transport: `public-recursive-qname`
+- Client -> server payload: QNAME only
+- Server -> client payload: TXT answer only
+- EDNS0 OPT: used only as a normal DNS UDP size advertisement, not as a tunnel payload carrier
+- Certificate pinning: required by default
 
----
+This makes the main path suitable for public recursive resolvers such as
+`1.1.1.1`, `8.8.8.8`, `9.9.9.9`, and other public resolvers where TXT answers
+are preserved.
 
-## ⚡ What is this?
-Imagine your internet traffic is a letter. Firewalls read the envelope and throw it away if they don't like the address.  
-**Slipstream Rust Plus** puts your letter inside a "DNS Envelope". Firewalls think it's just a normal address lookup (like asking "where is google.com?") and let it pass. Inside that envelope is your high-speed internet connection!
-
-### 📈 Why "Plus"?
-We took the original Slipstream and gave it **superpowers**:
-- **🚀 50x Faster**: Optimized for blazing fast speeds up to **4Gbps**!
-- **🛡️ Unblockable**: Uses **Multi-Resolver** technology to dodge censorship.
-- **🧠 Smart**: Automatically adjusts to your network quality (Adaptive MTU).
-
-```mermaid
-%%{init: {'theme': 'dark'}}%%
-xychart-beta
-    title "Download Speed Comparison (MB/s)"
-    x-axis ["dnstt", "Slipstream (C)", "Rust (Auth)", "Rust Plus"]
-    y-axis "MB/s"
-    bar [4.01, 9.12, 24.57, 512]
-```
-
----
-
-## 🛠️ Easy Installation (Beginner Friendly)
-
-Follow these simple steps to get started. You don't need to be a coding wizard! 🧙‍♂️
-
-### 1. Install Requirements
-Open your **Terminal** (Ctrl+Alt+T) and run this command to install the necessary tools:
-
-```bash
-# Ubuntu / Debian
-sudo apt update && sudo apt install -y build-essential cmake pkg-config libssl-dev git rustc cargo
-
-# Arch Linux
-sudo pacman -S base-devel cmake openssl git rust
-```
-
-### 2. Download the Project
-Now, let's get the code:
+## Build
 
 ```bash
 git clone https://github.com/Fox-Fig/slipstream-rust-plus.git
 cd slipstream-rust-plus
 git submodule update --init --recursive
-```
-
-### 3. Build It!
-Turn the code into a working program (this might take a few minutes for the first time):
-
-```bash
 cargo build -p slipstream-client -p slipstream-server --release
 ```
 
----
+## Run
 
-## 🚀 How to Run
-
-### Client (Your Computer)
-To bypass censorship effectively, we use **multiple DNS servers** (Resolvers). This makes your connection rock solid! 💪
-
-Run this command:
-
-```bash
-./target/release/slipstream-client \
-  --domain example.com \
-  --resolver 1.1.1.1 \
-  --resolver 8.8.8.8 \
-  --resolver 9.9.9.9 \
-  --tcp-listen-port 5201
-```
-
-**🔍 What do these mean?**
-- `--domain`: The fake domain we use for the tunnel (match this with your server).
-- `--resolver`: The DNS servers we talk to. **The more, the better!**
-- `--tcp-listen-port`: The port where your high-speed internet will appear locally.
-
-### Server (Remote VPS)
-On your server outside the firewall:
+Start the server:
 
 ```bash
 ./target/release/slipstream-server \
@@ -96,33 +38,36 @@ On your server outside the firewall:
   --reset-seed ./reset-seed
 ```
 
----
+Copy the server leaf certificate to the client machine and pin it:
 
-## 📐 How it Works (Visualized)
-
-```mermaid
-graph LR
-    User[👤 You] --> Client[My Computer]
-    Client --> R1[DNS 1.1.1.1]
-    Client --> R2[DNS 8.8.8.8]
-    Client --> R3[DNS 9.9.9.9]
-    R1 --> Server[☁️ Remote VPS]
-    R2 --> Server
-    R3 --> Server
-    Server --> World[🌍 The Internet]
+```bash
+scp user@server:/path/to/cert.pem ./cert.pem
 ```
 
----
+Start the client:
 
-## ⚖️ License
-This project is licensed under the **GNU General Public License v3.0 (GPLv3)**.  
-Portions of this software are based on work originally licensed under the **Apache License 2.0**.
+```bash
+./target/release/slipstream-client \
+  --domain example.com \
+  --resolver 1.1.1.1 \
+  --resolver 8.8.8.8 \
+  --resolver 9.9.9.9 \
+  --cert ./cert.pem \
+  --tcp-listen-port 5201
+```
 
-> **License Exception for Upstream Contribution:**  
-> Although this project is licensed under GPLv3, the author grants the maintainers of the original upstream project (`Mygod/slipstream-rust`) the right to include, distribute, and modify the contributions made in this fork under the terms of the Apache License 2.0.
+## Public DNS notes
 
----
-<div align="center">
-  <p>Made with ❤️ at <a href="https://t.me/foxfig">FoxFig</a></p>
-  <p>Dedicated to all people of Iran 🇮🇷</p>
-</div>
+- Shorter domains improve QNAME capacity and throughput.
+- More resolvers are not always better; prefer a small set of healthy resolvers.
+- `--public-safe-response-bytes` keeps responses small enough for classic 512-byte DNS paths.
+- `--public-fast-response-bytes` is optional and should only be used when the resolver probe confirms larger TXT responses work for your chosen resolvers.
+- `--dev-authoritative` is a development-only escape hatch for direct authoritative paths and is not the default.
+- `--insecure-no-pin` exists for local dev/test only and disables mandatory certificate pinning.
+
+## Docs
+
+- Usage: [docs/usage.md](docs/usage.md)
+- DNS codec: [docs/dns-codec.md](docs/dns-codec.md)
+- Protocol notes: [docs/protocol.md](docs/protocol.md)
+- Configuration: [docs/config.md](docs/config.md)

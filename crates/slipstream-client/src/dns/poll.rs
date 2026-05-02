@@ -1,10 +1,12 @@
 use crate::error::ClientError;
 use slipstream_core::net::is_transient_udp_error;
-use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_TXT};
+use slipstream_dns::{
+    build_qname, build_query_with_edns0_payload, encode_query, QueryParams, CLASS_IN, RR_TXT,
+};
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_current_time, picoquic_prepare_packet_ex, slipstream_request_poll,
 };
-use slipstream_ffi::{ClientConfig, ResolverMode};
+use slipstream_ffi::{ClientConfig, DnsTransportMode, ResolverMode};
 use std::collections::HashMap;
 use tokio::net::UdpSocket as TokioUdpSocket;
 
@@ -41,7 +43,7 @@ pub(crate) async fn send_poll_queries(
     remaining: &mut usize,
     send_buf: &mut [u8],
 ) -> Result<(), ClientError> {
-    if !refresh_resolver_path(cnx, resolver) {
+    if !resolver.enabled || !refresh_resolver_path(cnx, resolver) {
         return Ok(());
     }
     let mut remaining_count = *remaining;
@@ -87,20 +89,28 @@ pub(crate) async fn send_poll_queries(
         resolver.debug.polls_sent = resolver.debug.polls_sent.saturating_add(1);
 
         let poll_id = *dns_id;
-        let qname = build_qname(&send_buf[..send_length], config.domain)
-            .map_err(|err| ClientError::new(err.to_string()))?;
-        let params = QueryParams {
-            id: poll_id,
-            qname: &qname,
-            qtype: RR_TXT,
-            qclass: CLASS_IN,
-            rd: true,
-            cd: false,
-            qdcount: 1,
-            is_query: true,
-        };
         *dns_id = dns_id.wrapping_add(1);
-        let packet = encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?;
+        let packet = match resolver.transport_mode {
+            DnsTransportMode::PublicRecursiveQname => {
+                let qname = build_qname(&send_buf[..send_length], config.domain)
+                    .map_err(|err| ClientError::new(err.to_string()))?;
+                let params = QueryParams {
+                    id: poll_id,
+                    qname: &qname,
+                    qtype: RR_TXT,
+                    qclass: CLASS_IN,
+                    rd: true,
+                    cd: false,
+                    qdcount: 1,
+                    is_query: true,
+                };
+                encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?
+            }
+            DnsTransportMode::LegacyEdns0Payload => {
+                build_query_with_edns0_payload(&send_buf[..send_length], config.domain, poll_id)
+                    .map_err(|err| ClientError::new(err.to_string()))?
+            }
+        };
 
         let dest = sockaddr_storage_to_socket_addr(&addr_to)?;
         let dest = normalize_dual_stack_addr(dest);

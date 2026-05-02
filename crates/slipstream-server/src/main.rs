@@ -9,6 +9,7 @@ use server::{run_server, ServerConfig};
 use slipstream_core::{
     normalize_domain, parse_host_port, parse_host_port_parts, sip003, AddressKind, HostPort,
 };
+use slipstream_dns::DEFAULT_PUBLIC_SAFE_RESPONSE_BYTES;
 use tokio::runtime::Builder;
 use tracing_subscriber::EnvFilter;
 
@@ -43,6 +44,13 @@ struct Args {
     max_connections: u32,
     #[arg(long = "idle-timeout-seconds", default_value_t = 1200)]
     idle_timeout_seconds: u64,
+    #[arg(
+        long = "public-safe-response-bytes",
+        default_value_t = DEFAULT_PUBLIC_SAFE_RESPONSE_BYTES
+    )]
+    public_safe_response_bytes: usize,
+    #[arg(long = "public-fast-response-bytes")]
+    public_fast_response_bytes: Option<usize>,
     #[arg(long = "debug-streams")]
     debug_streams: bool,
     #[arg(long = "debug-commands")]
@@ -172,6 +180,15 @@ fn main() {
         domains,
         max_connections,
         idle_timeout_seconds: args.idle_timeout_seconds,
+        public_safe_response_bytes: args.public_safe_response_bytes,
+        public_fast_response_bytes: validate_response_sizes(
+            args.public_safe_response_bytes,
+            args.public_fast_response_bytes,
+        )
+        .unwrap_or_else(|err| {
+            tracing::error!("{}", err);
+            std::process::exit(2);
+        }),
         debug_streams: args.debug_streams,
         debug_commands: args.debug_commands,
     };
@@ -228,6 +245,27 @@ fn parse_max_connections(input: &str) -> Result<u32, String> {
 
 fn cli_provided(matches: &clap::ArgMatches, id: &str) -> bool {
     matches.value_source(id) == Some(ValueSource::CommandLine)
+}
+
+fn validate_response_sizes(
+    public_safe_response_bytes: usize,
+    public_fast_response_bytes: Option<usize>,
+) -> Result<Option<usize>, String> {
+    if public_safe_response_bytes == 0 {
+        return Err("public-safe-response-bytes must be at least 1".to_string());
+    }
+    if let Some(public_fast_response_bytes) = public_fast_response_bytes {
+        if public_fast_response_bytes == 0 {
+            return Err("public-fast-response-bytes must be at least 1".to_string());
+        }
+        if public_fast_response_bytes < public_safe_response_bytes {
+            return Err(
+                "public-fast-response-bytes must be greater than or equal to public-safe-response-bytes"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(public_fast_response_bytes)
 }
 
 fn parse_domains_from_options(options: &[sip003::Sip003Option]) -> Result<Vec<String>, String> {
